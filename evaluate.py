@@ -16,14 +16,20 @@ import copy
 import logging
 from dataclasses import dataclass, field
 from typing import Dict, Optional, Sequence
+from datasets import load_dataset
 
 import torch
 import os
 import transformers
-from peft import LoraConfig, get_peft_model
+from peft import LoraConfig, get_peft_model, PeftModel
 import utils
 from torch.utils.data import Dataset
 from transformers import Trainer
+
+from tqdm import tqdm
+
+import json
+import numpy as np
 
 IGNORE_INDEX = -100
 DEFAULT_PAD_TOKEN = "[PAD]"
@@ -47,24 +53,13 @@ PROMPT_DICT = {
 @dataclass
 class ModelArguments:
     model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
+    lora_weight_path: Optional[str] = field(default="")
     load_8_bit: bool = field(default=True)
 
 @dataclass
 class DataArguments:
-    data_path: str = field(default=None, metadata={"help": "Path to the training data."})
-    eval_data_path: str = field(default=None, metadata={"help": "Path to the eval data."})
+    test_data_path: str = field(default=None, metadata={"help": "Path to the testing data."})
 
-
-@dataclass
-class TrainingArguments(transformers.TrainingArguments):
-    cache_dir: Optional[str] = field(default=None)
-    optim: str = field(default="adamw_torch")
-    model_max_length: int = field(
-        default=512,
-        metadata={"help": "Maximum sequence length. Sequences will be right padded (and possibly truncated)."},
-    )
-    # additional arguments
-    wandb_project: str = field(default="")
 
 def smart_tokenizer_and_embedding_resize(
     special_tokens_dict: Dict,
@@ -178,30 +173,28 @@ class DataCollatorForSupervisedDataset(object):
 
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.data_path)
-    eval_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.eval_data_path) if data_args.eval_data_path else None
+    test_dataset = SupervisedDataset(tokenizer=tokenizer, data_path=data_args.test_data_path)
     data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
     return dict(train_dataset=train_dataset, eval_dataset=eval_dataset, data_collator=data_collator)
 
 
 def train():
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
-    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments))
+    model_args, data_args = parser.parse_args_into_dataclasses()
 
     print(model_args)
     print(data_args)
 
-    # model = transformers.AutoModelForCausalLM.from_pretrained(
-    #     model_args.model_name_or_path,
-    #     load_in_8_bit=model_args.load_8_bit,
-    #     cache_dir=training_args.cache_dir
-    # )
+    if torch.cuda.is_available():
+        device = "cuda"
+    else:
+        device = "cpu"
 
     model = transformers.LlamaForCausalLM.from_pretrained(
         model_args.model_name_or_path,
         load_in_8bit=model_args.load_8_bit,
         torch_dtype=torch.float16,
-        cache_dir=training_args.cache_dir,
+        cache_dir=None,
         device_map="auto"
     )
 
@@ -214,29 +207,19 @@ def train():
         bias="none",
         task_type = "CAUSAL_LM"
     )
-    # lora_config = LoRaConfig(
-    #     r = training_args.lora_r,
-    #     lora_alpha = training_args.lora_alpha,
-    #     target_modules = training_args.lora_target_modules, # TODO
-    #     lora_dropout = training_args.lora_dropout,
-    #     bias=training_args.lora_bias,
-    #     task_type = "CAUSAL_LM"
-    # )
-    
-    model = get_peft_model(model, lora_config)
 
-    # tokenizer = transformers.AutoTokenizer.from_pretrained(
-    #     model_args.model_name_or_path,
-    #     cache_dir=training_args.cache_dir,
-    #     model_max_length=training_args.model_max_length,
-    #     padding_side="right",
-    #     use_fast=False,
-    # )
+    model = PeftModel.from_pretrained(
+        model,
+        model_args.lora_weight_path,
+        torch_dtype=torch.float16,
+    )
+
+    model.eval()
 
     tokenizer = transformers.LlamaTokenizer.from_pretrained(
         model_args.model_name_or_path,
-        cache_dir=training_args.cache_dir,
-        model_max_length=training_args.model_max_length,
+        cache_dir=None,
+        model_max_length=512,
         padding_side="right"
     )
     
@@ -256,23 +239,73 @@ def train():
         model=model,
     )
 
-    data_module = make_supervised_data_module(tokenizer=tokenizer, data_args=data_args)
+    test_dataset = load_dataset("json", data_files=data_args.test_data_path)
 
-    # Check if parameter passed or if set within environ
-    use_wandb = len(training_args.wandb_project) > 0 or (
-        "WANDB_PROJECT" in os.environ and len(os.environ["WANDB_PROJECT"]) > 0
-    )
-    # Only overwrite environ if wandb param passed
-    if len(training_args.wandb_project) > 0:
-        os.environ["WANDB_PROJECT"] = training_args.wandb_project
+    result_list = []
 
-    trainer = Trainer(model=model, 
-                        tokenizer=tokenizer, 
-                        args=training_args, 
-                        **data_module)
-    trainer.train()
-    trainer.save_state()
-    trainer.save_model(output_dir=training_args.output_dir)
+    with torch.no_grad():
+        for i in tqdm(range(len(test_dataset["train"]))):
+            batch = test_dataset["train"][i]
+            label = batch["output"]
+
+            prompt_input = PROMPT_DICT["prompt_input"]
+            full_prompt = prompt_input.format_map(batch)
+
+            tokenized_prompt = _tokenize_fn([full_prompt], tokenizer)
+            input_ids = tokenized_prompt["input_ids"][0].unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                greedy_output = model.generate(
+                    input_ids=input_ids,
+                    max_new_tokens=5,
+                    output_scores=True,
+                    return_dict_in_generate=True
+                )
+
+                sorted_score, sorted_score_idx = torch.sort(greedy_output.scores[0], descending=True)
+                
+                print("top 5 score and associated tokens")
+                print(sorted_score[:, :5])
+                print(sorted_score_idx[:, :5])
+               
+            raw_output = tokenizer.decode(greedy_output.sequences[0], skip_special_tokens=True)
+            _, _, prediction = raw_output.partition("### Response:")
+
+            match_score = int(label.lower() in prediction.lower())
+
+            result_list.append({
+                "prediction": prediction.lower(),
+                "label": label.lower(),
+                "match_score": match_score,
+                "total_nb_objects": batch["total_nb_objects"],
+                "image_path": batch["image_path"]
+            })
+
+            print(f"label: {label}, input: {batch['input']}")
+            print(f"prediction: {prediction}")
+
+    save_filename = model_args.lora_weight_path.partition("output/")[-1]
+    save_filename = save_filename.replace("/", "")
+
+    file_type = ""
+    if "train" in data_args.test_data_path:
+        file_type = "train"
+    if "dev" in data_args.test_data_path:
+        file_type = "dev"
+    if "test" in data_args.test_data_path:
+        file_type = "test"
+
+    with open(f"./eval_result/{save_filename}_{file_type}_result.json", "w") as fout:
+        fout.write(json.dumps(result_list, indent=4))
+
+    match_score_list = []
+    for r in result_list:
+        match_score_list.append(int(r["match_score"]))
+
+    print(model_args.lora_weight_path)
+    print(data_args.test_data_path)
+    print("Accuracy: ")
+    print(np.mean(np.array(match_score_list)))
 
 
 if __name__ == "__main__":
